@@ -28,6 +28,78 @@
       </span>
     </p>
 
+    <section v-if="meta.key === 'adhoc_export'" class="delivery-panel" data-testid="delivery-panel">
+      <div class="delivery-head">
+        <div>
+          <h3>分区交付批</h3>
+          <p class="page-desc">按任务各自关联的分区交付，同批只允许一个已核对口径；未齐备的分区不产出文件。</p>
+        </div>
+        <div class="page-actions">
+          <button class="btn" data-testid="delivery-create" type="button" @click="createBatch">
+            登记交付批（已选 {{ selectedTaskIds.length }} 项）
+          </button>
+          <button class="btn" data-testid="delivery-repair" type="button" @click="repairNorth">
+            修复北区输入
+          </button>
+          <button class="btn" data-testid="delivery-retry" type="button" :disabled="!batch" @click="retryBatch">
+            补算仍需处理的分区
+          </button>
+          <button class="btn primary" data-testid="delivery-reconcile" type="button" :disabled="!batch" @click="reconcileBatch">
+            逐条核对并汇总跨区总账
+          </button>
+        </div>
+      </div>
+      <p v-if="deliveryMessage" class="delivery-message" data-testid="delivery-message">{{ deliveryMessage }}</p>
+
+      <div v-if="batch" class="delivery-grid">
+        <article v-for="binding in batch.bindings" :key="binding.task_id" class="delivery-card">
+          <strong>{{ binding.zone }}区 · 任务 {{ binding.task_id }}</strong>
+          <span class="page-desc">{{ binding.task_name }}</span>
+          <span class="page-desc">口径：{{ binding.caliber_version }}</span>
+          <span class="page-desc">模板：{{ binding.template_name }}（#{{ binding.template_id }}）</span>
+          <span class="page-desc">
+            覆盖：{{ partitionOf(binding.zone)?.coverage?.included ?? 0 }}/{{ partitionOf(binding.zone)?.coverage?.expected ?? 0 }}
+            <template v-if="partitionOf(binding.zone)?.missing_detail_ids?.length">
+              · 缺 {{ partitionOf(binding.zone)?.missing_detail_ids?.join(',') }}
+            </template>
+          </span>
+          <span class="page-desc">状态：{{ partitionOf(binding.zone)?.status ?? '未领取' }}</span>
+          <span v-for="artifact in artifactsOf(binding.zone)" :key="artifact.artifact_id" class="page-desc">
+            产物 v{{ artifact.version }} · {{ artifact.row_count }} 行 · {{ artifact.input_fingerprint }}
+          </span>
+        </article>
+      </div>
+
+      <div v-if="reconcileResult" class="delivery-reconcile" data-testid="delivery-reconcile-result">
+        <p>{{ reconcileResult.message }}</p>
+        <table class="data-table">
+          <thead>
+            <tr><th>核算区</th><th>产物版本</th><th>行数</th><th>GMV</th><th>订单数</th><th>核验</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="check in reconcileResult.checks" :key="check.zone">
+              <td>{{ check.zone }}</td>
+              <td>{{ check.artifact_version ?? '—' }}</td>
+              <td>{{ check.row_count ?? '—' }}</td>
+              <td>{{ check.totals?.GMV ?? '—' }}</td>
+              <td>{{ check.totals?.订单数 ?? '—' }}</td>
+              <td>{{ check.delivered ? (check.valid ? '可核验' : '不可核验') : '未交付' }}</td>
+              <td>{{ check.reason }}</td>
+            </tr>
+            <tr>
+              <td>跨区总计</td>
+              <td>—</td>
+              <td>{{ reconcileResult.cross_zone.combined_row_count }}</td>
+              <td>{{ reconcileResult.cross_zone.combined_totals.GMV ?? '—' }}</td>
+              <td>{{ reconcileResult.cross_zone.combined_totals.订单数 ?? '—' }}</td>
+              <td>{{ reconcileResult.cross_zone.matches_upstream ? '与上游一致' : '与上游不一致' }}</td>
+              <td>文件加总</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -50,6 +122,13 @@
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
+            <input
+              v-if="meta.key === 'adhoc_export'"
+              type="checkbox"
+              :data-testid="`select-task-${row.id}`"
+              :checked="selectedTaskIds.includes(Number(row.id))"
+              @change="toggleTask(Number(row.id))"
+            />
             <button
               v-for="action in meta.actions"
               :key="action"
@@ -103,6 +182,14 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import {
+  createDeliveryBatch,
+  dispatchDeliveryBatch,
+  reconcileDeliveryBatch,
+  repairPartition,
+  retryDeliveryBatch,
+} from '@/api/delivery'
+import type { DeliveryBatch, DeliveryReconcile } from '@/api/delivery'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +202,76 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const selectedTaskIds = ref<number[]>([])
+const batch = ref<DeliveryBatch | null>(null)
+const reconcileResult = ref<DeliveryReconcile | null>(null)
+const deliveryMessage = ref('')
+
+function toggleTask(taskId: number) {
+  selectedTaskIds.value = selectedTaskIds.value.includes(taskId)
+    ? selectedTaskIds.value.filter((id) => id !== taskId)
+    : [...selectedTaskIds.value, taskId]
+}
+
+function partitionOf(zone: string) {
+  return batch.value?.partitions.find((item) => item.zone === zone)
+}
+
+function artifactsOf(zone: string) {
+  return (batch.value?.artifacts ?? []).filter((item) => item.zone === zone)
+}
+
+async function createBatch() {
+  deliveryMessage.value = ''
+  reconcileResult.value = null
+  try {
+    const result = await createDeliveryBatch(selectedTaskIds.value, '202610')
+    if (!result.ok || !result.batch) throw new Error(result.message ?? '登记交付批失败')
+    batch.value = result.batch
+    const dispatched = await dispatchDeliveryBatch(result.batch.batch_id)
+    const delivered = dispatched.delivered.map((item) => item.zone).join('、') || '无'
+    const pending = dispatched.pending.map((item) => `${item.zone}（${item.reason}）`).join('、') || '无'
+    deliveryMessage.value = `先领取已齐分区：${delivered}；待补算：${pending}`
+  } catch (error) {
+    deliveryMessage.value = error instanceof Error ? error.message : '登记交付批失败'
+  }
+}
+
+async function repairNorth() {
+  deliveryMessage.value = ''
+  try {
+    const result = await repairPartition('北区')
+    deliveryMessage.value = result.restored_detail_ids.length
+      ? `已补齐北区明细：${result.restored_detail_ids.join('、')}`
+      : '北区没有缺失明细'
+  } catch (error) {
+    deliveryMessage.value = error instanceof Error ? error.message : '修复输入失败'
+  }
+}
+
+async function retryBatch() {
+  if (!batch.value) return
+  deliveryMessage.value = ''
+  try {
+    const result = await retryDeliveryBatch(batch.value.batch_id)
+    const recomputed = result.recomputed.map((item) => `${item.zone} v${item.artifact_version}`).join('、') || '无'
+    const untouched = result.untouched.map((item) => item.zone).join('、') || '无'
+    deliveryMessage.value = `补算：${recomputed}；已核验无需重跑：${untouched}`
+  } catch (error) {
+    deliveryMessage.value = error instanceof Error ? error.message : '补算失败'
+  }
+}
+
+async function reconcileBatch() {
+  if (!batch.value) return
+  deliveryMessage.value = ''
+  try {
+    reconcileResult.value = await reconcileDeliveryBatch(batch.value.batch_id)
+    deliveryMessage.value = reconcileResult.value.message
+  } catch (error) {
+    deliveryMessage.value = error instanceof Error ? error.message : '对账失败'
+  }
+}
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -182,6 +339,12 @@ async function reload() {
     const payload = await listEntries(meta.key, filters.value)
     rows.value = payload.items
     total.value = payload.total
+    if (meta.key === 'adhoc_export' && !selectedTaskIds.value.length) {
+      // 默认勾选带核算区的分区任务，其余任务没有分区归属，登记交付批时会被拒绝。
+      selectedTaskIds.value = rows.value
+        .filter((row) => String(row['分区过滤'] ?? '').includes('核算区'))
+        .map((row) => Number(row.id))
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
   }

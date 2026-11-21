@@ -1,9 +1,15 @@
 """切片查询领域服务：多维立方消费，按维度切片、过滤和排序。"""
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.delivery_support import (
+    CUBE_CALIBERS,
+    fingerprint_rows,
+    get_partition_catalog,
+)
 from app.store import store
 
 
@@ -85,6 +91,88 @@ class SliceQueryService(BaseModuleService):
             row for row in store.rows(self.MODULE)
             if row.get("数据立方") == cube_name and row.get("status") == "已发布"
         ]
+
+    def analyze_partitions(
+        self, template_id: int, zones: list[str] | None = None,
+        month: str | None = None,
+    ) -> dict[str, Any]:
+        """按核算区生成带覆盖信息的分析结果；缺明细的分区不产出可用结果。
+
+        覆盖信息说明每个分区算了哪些上游明细、还缺哪些明细、输入指纹是什么，
+        下游即席导出据此判断一个分区到底能不能进交付。切片结果在这里复制一份，
+        避免导出阶段再回头重复扫描上游明细。
+        """
+        template = store.find(self.MODULE, template_id)
+        if template is None:
+            return {"ok": False, "message": f"查询模板 {template_id} 不存在"}
+
+        catalog = get_partition_catalog()
+        target_zones = zones or catalog.zones()
+        template_cube = str(template.get("数据立方", ""))
+        partitions: list[dict[str, Any]] = []
+
+        for zone in target_zones:
+            expected = catalog.expected_rows(zone, month)
+            if not expected:
+                partitions.append({
+                    "zone": zone,
+                    "ready": False,
+                    "reason": "上游无该核算区明细",
+                    "expected_detail_ids": [],
+                    "included_detail_ids": [],
+                    "missing_detail_ids": [],
+                    "row_count": 0,
+                    "input_fingerprint": fingerprint_rows([]),
+                    "input_revision": catalog.revision(zone),
+                    "rows": [],
+                    "coverage": {"expected": 0, "included": 0, "missing": 0, "ratio": 0.0},
+                })
+                continue
+
+            available = catalog.available_rows(zone, month)
+            missing_ids = catalog.missing_ids(zone, month)
+            fp = catalog.fingerprint(zone, month)
+            revision = catalog.revision(zone)
+
+            result = self.execute_slice_query(template_id, available)
+            rows = copy.deepcopy(list(result.get("data", []))) if result.get("ok") else []
+            ready = not missing_ids and bool(result.get("ok"))
+
+            partitions.append({
+                "zone": zone,
+                "ready": ready,
+                "reason": "" if ready else (
+                    f"上游缺明细：{','.join(missing_ids)}" if missing_ids else "切片执行失败"
+                ),
+                "template_id": template_id,
+                "template_name": str(template.get("模板名称", "")),
+                "cube_name": template_cube,
+                "expected_detail_ids": [str(r.get("detail_id")) for r in expected],
+                "included_detail_ids": [str(r.get("detail_id")) for r in available],
+                "missing_detail_ids": missing_ids,
+                "row_count": len(rows),
+                "input_fingerprint": fp,
+                "input_revision": revision,
+                "rows": rows,
+                "coverage": {
+                    "expected": len(expected),
+                    "included": len(available),
+                    "missing": len(missing_ids),
+                    "ratio": round(len(available) / len(expected), 4),
+                },
+            })
+
+        ready_zones = [p["zone"] for p in partitions if p["ready"]]
+        return {
+            "ok": True,
+            "template_id": template_id,
+            "template_name": str(template.get("模板名称", "")),
+            "cube_name": template_cube,
+            "caliber_version": CUBE_CALIBERS.get(template_cube, ""),
+            "ready_zones": ready_zones,
+            "pending_zones": [p["zone"] for p in partitions if not p["ready"]],
+            "partitions": partitions,
+        }
 
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()

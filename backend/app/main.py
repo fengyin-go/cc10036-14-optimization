@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.routers import ROUTERS
@@ -286,6 +287,106 @@ def scheduler_topology() -> dict[str, Any]:
     if svc is None:
         return {"ok": False, "message": "调度服务未就绪"}
     return svc.topological_order()
+
+
+# ---- 分区交付：切片分析 → 即席导出 → 可对账产物 ----
+class DeliveryBatchPayload(BaseModel):
+    task_ids: list[int] = Field(default_factory=list)
+    batch_name: str = ""
+    month: str | None = None
+
+
+class DeliveryDispatchPayload(BaseModel):
+    task_ids: list[int] | None = None
+
+
+class PartitionRepairPayload(BaseModel):
+    zone: str
+    detail_ids: list[str] | None = None
+
+
+def _export_service():
+    svc = service_for("adhoc_export")
+    if svc is None:
+        raise HTTPException(status_code=503, detail="即席导出服务未就绪")
+    return svc
+
+
+@app.post("/api/analytics/delivery/batches")
+def create_delivery_batch(payload: DeliveryBatchPayload) -> dict[str, Any]:
+    """登记交付批：核对口径并绑定每个任务负责的分区。"""
+    return _export_service().create_delivery_batch(
+        payload.task_ids, batch_name=payload.batch_name, month=payload.month,
+    )
+
+
+@app.get("/api/analytics/delivery/batches")
+def list_delivery_batches() -> dict[str, Any]:
+    """交付批列表。"""
+    return _export_service().list_delivery_batches()
+
+
+@app.get("/api/analytics/delivery/batches/{batch_id}")
+def get_delivery_batch(batch_id: int) -> dict[str, Any]:
+    """交付批详情：分区覆盖、产物版本与事件。"""
+    return _export_service().get_delivery_batch(batch_id)
+
+
+@app.post("/api/analytics/delivery/batches/{batch_id}/dispatch")
+def dispatch_delivery_batch(
+    batch_id: int, payload: DeliveryDispatchPayload | None = None,
+) -> dict[str, Any]:
+    """领取交付批：已齐的分区先产出，未齐的保持待补算。"""
+    return _export_service().dispatch_delivery_batch(
+        batch_id, payload.task_ids if payload else None,
+    )
+
+
+@app.post("/api/analytics/delivery/batches/{batch_id}/retry")
+def retry_delivery_batch(batch_id: int) -> dict[str, Any]:
+    """失败重试：只补算仍需补算的分区，不重跑已核验产物。"""
+    return _export_service().retry_delivery_batch(batch_id)
+
+
+@app.post("/api/analytics/delivery/batches/{batch_id}/reconcile")
+def reconcile_delivery_batch(batch_id: int) -> dict[str, Any]:
+    """逐分区核对产物文件，并用文件计算跨区总账。"""
+    return _export_service().reconcile_delivery_batch(batch_id)
+
+
+@app.get("/api/analytics/delivery/partitions/repairs")
+def list_partition_repairs() -> dict[str, Any]:
+    """输入修复记录。"""
+    from app.services.delivery_support import get_partition_catalog
+
+    return {"ok": True, "items": get_partition_catalog().repairs()}
+
+
+@app.get("/api/analytics/delivery/partitions/{zone}")
+def partition_status(zone: str, month: str = "202610") -> dict[str, Any]:
+    """上游分区齐备情况。"""
+    from app.services.delivery_support import get_partition_catalog
+
+    catalog = get_partition_catalog()
+    return {
+        "ok": True,
+        "zone": zone,
+        "month": month,
+        "missing_detail_ids": catalog.missing_ids(zone, month),
+        "included_detail_ids": [
+            row["detail_id"] for row in catalog.available_rows(zone, month)
+        ],
+        "input_fingerprint": catalog.fingerprint(zone, month),
+        "input_revision": catalog.revision(zone),
+    }
+
+
+@app.post("/api/analytics/delivery/partitions/repair")
+def repair_partition(payload: PartitionRepairPayload) -> dict[str, Any]:
+    """修复上游输入：补齐缺失明细；已交付产物会用指纹核验是否仍可用。"""
+    from app.services.delivery_support import get_partition_catalog
+
+    return get_partition_catalog().repair(payload.zone, payload.detail_ids)
 
 
 # ---- 辅助数据生成函数 ----

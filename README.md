@@ -79,3 +79,27 @@ npm run dev
 
 领域：数据工程
 子方向：数据分析与数据应用
+
+## 分区交付
+
+即席导出支持把多个导出任务组成一个**交付批**，每个任务按自己的分区过滤
+（`month='202610';核算区='北区'`）认领一个独立分区，由切片查询先生成带覆盖
+信息的分析结果，再由导出写成可对账的产物文件。
+
+- `POST /api/analytics/delivery/batches` 登记交付批：核对口径，同批混装不同口径或
+  未登记口径整批拒绝；同一核算区不能被两个任务重复认领。
+- `POST /api/analytics/delivery/batches/{id}/dispatch` 先领取已齐分区，缺明细的分区
+  保持「待补算」，不写任何文件。
+- `POST /api/analytics/delivery/partitions/repair` 修复上游输入。
+- `POST /api/analytics/delivery/batches/{id}/retry` 只补算仍缺明细、上游已变化或产物
+  文件校验不通过的分区；已核验的产物不重跑。
+- `POST /api/analytics/delivery/batches/{id}/reconcile` 逐分区核对实际文件
+  （校验和、行数、口径、输入指纹），并只用文件计算跨区总账，同时给出与上游独立复算
+  的对照值。
+
+产物默认写到 `$TMPDIR/multi_analysis_delivery/batch_<id>/`，可用
+`EXPORT_ARTIFACT_DIR` 固定到备查目录。回归测试：
+
+```bash
+cd backend && .venv/bin/python -m unittest discover -s tests -v
+```

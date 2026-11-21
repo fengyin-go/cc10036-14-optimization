@@ -142,6 +142,13 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
             "过滤条件": "", "排序规则": "事件数:DESC",
             "返回行数": "200", "缓存TTL": "1800",
         },
+        {
+            "id": 5, "status": "已发布", "pending": False, "abnormal": False,
+            "模板名称": "区域类目GMV交付明细", "数据立方": "交易分析立方",
+            "查询维值": "月份=202610",
+            "过滤条件": "", "排序规则": "GMV:DESC",
+            "返回行数": "1000", "缓存TTL": "600",
+        },
     ],
 
     # ---- 分群圈选 ----
@@ -220,6 +227,18 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
             "任务名称": "用户画像全量导出", "查询SQL": "SELECT * FROM dim_user_profile WHERE status='active'",
             "导出格式": "json", "行数限制": "2000000", "是否压缩": "是",
             "分区过滤": "", "创建时间": "2026-10-22",
+        },
+        {
+            "id": 4, "status": "排队中", "pending": True, "abnormal": False,
+            "任务名称": "10月北区类目GMV分区导出", "查询SQL": "SELECT 商品类目, SUM(GMV) AS GMV, SUM(订单数) AS 订单数 FROM cube_trade WHERE month='202610' GROUP BY 商品类目",
+            "导出格式": "csv", "行数限制": "1000", "是否压缩": "否",
+            "分区过滤": "month='202610';核算区='北区'", "创建时间": "2026-10-23",
+        },
+        {
+            "id": 5, "status": "排队中", "pending": True, "abnormal": False,
+            "任务名称": "10月南区类目GMV分区导出", "查询SQL": "SELECT 商品类目, SUM(GMV) AS GMV, SUM(订单数) AS 订单数 FROM cube_trade WHERE month='202610' GROUP BY 商品类目",
+            "导出格式": "csv", "行数限制": "1000", "是否压缩": "否",
+            "分区过滤": "month='202610';核算区='南区'", "创建时间": "2026-10-23",
         },
     ],
 
